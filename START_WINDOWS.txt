@@ -1,0 +1,10 @@
+1) Open CMD/PowerShell.
+2) cd /d "D:\Post Button"
+3) py -m venv .venv
+4) .venv\Scripts\activate
+5) pip install -r requirements.txt
+6) copy .env.example .env
+7) Edit .env and put ONLY your new BotFather token and NEW API keys.
+8) python bot.py
+
+Do NOT paste secrets into chat or into the ZIP.
