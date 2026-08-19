@@ -1,5 +1,5 @@
 
-import asyncio, os, json
+import asyncio, os, json, html
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -51,6 +51,7 @@ T = {
 "publish":"📤 Yuborish","save_draft":"💾 Postni saqlash","cancel":"❌ Bekor qilish","addbtn":"➕ Knapka qo‘shish",
 "clearbtn":"🗑 Barcha knapkalarni o‘chirish","btntext":"🔘 Knapka matnini yuboring:",
 "btnurl":"🔗 Knapka URL manzilini yuboring:","btnrow":"↔️ Qaysi qatorga joylashsin? Raqam yuboring:",
+"btncolor":"🎨 Knapka rangini tanlang:","color_blue":"🔵 Ko‘k","color_green":"🟢 Yashil","color_red":"🔴 Qizil",
 "remove_attr":"⭐ Yozuvni olib tashlash","prem_info":"⭐ Premium — oyiga $1\n\n• Yozuvni olib tashlash\n• Yuborilgan postlarni tahrirlash\n• Cheksiz postlar",
 "buy":"⭐ Premiumni yoqish","topup":"💳 Balansni to‘ldirish","need":"Balans yetarli emas. Avval kamida $2 to‘ldiring.",
 "choose_net":"💰 Tarmoqni tanlang:","txid":"🧾 Muvaffaqiyatli to‘lovdan keyin TxID yuboring:",
@@ -77,6 +78,7 @@ T = {
 "media":"🖼 Fotoğraf veya video gönderin. Atlamak için /skip","text":"📝 Gönderi metnini gönderin. Metin yoksa /skip","ready":"✅ Gönderi hazır. İşlem seçin:",
 "preview":"👁 Önizleme","buttons":"🔘 Butonlar","publish":"📤 Gönder","save_draft":"💾 Gönderiyi kaydet","cancel":"❌ İptal","addbtn":"➕ Buton ekle",
 "clearbtn":"🗑 Tüm butonları sil","btntext":"🔘 Buton metnini gönderin:","btnurl":"🔗 Buton URL'sini gönderin:","btnrow":"↔️ Satır numarasını gönderin:",
+"btncolor":"🎨 Buton rengini seçin:","color_blue":"🔵 Mavi","color_green":"🟢 Yeşil","color_red":"🔴 Kırmızı",
 "remove_attr":"⭐ İmzayı kaldır","prem_info":"⭐ Premium — ayda $1\n\n• İmzayı kaldır\n• Gönderileri düzenle\n• Sınırsız gönderi",
 "buy":"⭐ Premium'u etkinleştir","topup":"💳 Bakiye yükle","need":"Bakiye yetersiz. Önce en az $2 yükleyin.",
 "choose_net":"💰 Ağ seçin:","txid":"🧾 Başarılı ödeme sonrası TxID gönderin:","topup_ok":"✅ Ödeme onaylandı. ${a:.2f} bakiyeye eklendi.",
@@ -95,6 +97,7 @@ T = {
 "media":"🖼 Отправьте фото или видео. Пропустить: /skip","text":"📝 Отправьте текст поста. Если текста нет: /skip","ready":"✅ Пост готов. Выберите действие:",
 "preview":"👁 Предпросмотр","buttons":"🔘 Кнопки","publish":"📤 Отправить","save_draft":"💾 Сохранить пост","cancel":"❌ Отмена","addbtn":"➕ Добавить кнопку",
 "clearbtn":"🗑 Удалить все кнопки","btntext":"🔘 Отправьте текст кнопки:","btnurl":"🔗 Отправьте URL кнопки:","btnrow":"↔️ Отправьте номер строки:",
+"btncolor":"🎨 Выберите цвет кнопки:","color_blue":"🔵 Синий","color_green":"🟢 Зелёный","color_red":"🔴 Красный",
 "remove_attr":"⭐ Убрать подпись","prem_info":"⭐ Premium — $1 в месяц\n\n• Убрать подпись\n• Редактировать отправленные посты\n• Неограниченные посты",
 "buy":"⭐ Подключить Premium","topup":"💳 Пополнить баланс","need":"Недостаточно средств. Сначала пополните минимум на $2.",
 "choose_net":"💰 Выберите сеть:","txid":"🧾 После успешной оплаты отправьте TxID:","topup_ok":"✅ Платёж подтверждён. ${a:.2f} добавлено на баланс.",
@@ -113,6 +116,7 @@ T = {
 "media":"🖼 أرسل صورة أو فيديو. للتخطي: /skip","text":"📝 أرسل نص المنشور. إذا لم يوجد: /skip","ready":"✅ المنشور جاهز. اختر الإجراء:",
 "preview":"👁 معاينة","buttons":"🔘 الأزرار","publish":"📤 إرسال","save_draft":"💾 حفظ المنشور","cancel":"❌ إلغاء","addbtn":"➕ إضافة زر",
 "clearbtn":"🗑 حذف كل الأزرار","btntext":"🔘 أرسل نص الزر:","btnurl":"🔗 أرسل رابط الزر:","btnrow":"↔️ أرسل رقم الصف:",
+"btncolor":"🎨 اختر لون الزر:","color_blue":"🔵 أزرق","color_green":"🟢 أخضر","color_red":"🔴 أحمر",
 "remove_attr":"⭐ إزالة التوقيع","prem_info":"⭐ Premium — $1 شهرياً\n\n• إزالة التوقيع\n• تعديل المنشورات المرسلة\n• منشورات غير محدودة",
 "buy":"⭐ تفعيل Premium","topup":"💳 شحن الرصيد","need":"الرصيد غير كافٍ. اشحن $2 على الأقل أولاً.",
 "choose_net":"💰 اختر الشبكة:","txid":"🧾 بعد نجاح الدفع أرسل TxID:","topup_ok":"✅ تم تأكيد الدفع. تمت إضافة ${a:.2f} إلى رصيدك.",
@@ -131,6 +135,7 @@ T = {
 "media":"🖼 Send a photo or video. Skip with /skip","text":"📝 Send the post text. If none: /skip","ready":"✅ Post is ready. Choose an action:",
 "preview":"👁 Preview","buttons":"🔘 Buttons","publish":"📤 Publish","cancel":"❌ Cancel","addbtn":"➕ Add button",
 "clearbtn":"🗑 Clear all buttons","btntext":"🔘 Send button text:","btnurl":"🔗 Send button URL:","btnrow":"↔️ Send row number:",
+"btncolor":"🎨 Choose button color:","color_blue":"🔵 Blue","color_green":"🟢 Green","color_red":"🔴 Red",
 "remove_attr":"⭐ Remove attribution","prem_info":"⭐ Premium — $1/month\n\n• Remove attribution\n• Edit published posts\n• Unlimited posts",
 "buy":"⭐ Enable Premium","topup":"💳 Top up balance","need":"Insufficient balance. Top up at least $2 first.",
 "choose_net":"💰 Choose network:","txid":"🧾 After successful payment, send the TxID:","topup_ok":"✅ Payment confirmed. ${a:.2f} was added to your balance.",
@@ -170,6 +175,14 @@ def kb_main(lang,admin=False):
 
 def kb_cancel():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌",callback_data="cancel")]])
+
+def kb_btncolor(lang,prefix):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=tr(lang,"color_blue"),callback_data=f"{prefix}:primary"),
+         InlineKeyboardButton(text=tr(lang,"color_green"),callback_data=f"{prefix}:success"),
+         InlineKeyboardButton(text=tr(lang,"color_red"),callback_data=f"{prefix}:danger")],
+        [InlineKeyboardButton(text=tr(lang,"cancel"),callback_data="cancel")]
+    ])
 
 def kb_draft(lang,premium):
     rows=[
@@ -371,9 +384,6 @@ async def build_markup(db,did):
         kwargs={"text":b["text"],"url":b["url"]}
         icon=b["icon_custom_emoji_id"] if "icon_custom_emoji_id" in b.keys() else ""
         style=b["style"] if "style" in b.keys() else "primary"
-        # START is always the green Telegram button, including buttons created by older versions.
-        if (b["text"] or "").strip().upper() == "START":
-            style="success"
         if icon:
             kwargs["icon_custom_emoji_id"]=icon
         if style in ("primary","success","danger"):
@@ -381,18 +391,27 @@ async def build_markup(db,did):
         rows.setdefault(int(b["row_no"]),[]).append(InlineKeyboardButton(**kwargs))
     return InlineKeyboardMarkup(inline_keyboard=[rows[k] for k in sorted(rows)]) if rows else None
 
+def html_safe_truncate(s,limit):
+    # Truncate HTML (used for parse_mode="HTML" captions/text) without cutting a tag in half,
+    # e.g. a <tg-emoji emoji-id="..."> tag that carries a Premium custom emoji.
+    if len(s)<=limit:return s
+    cut=s[:limit]
+    last_lt=cut.rfind("<");last_gt=cut.rfind(">")
+    if last_lt>last_gt:cut=cut[:last_lt]
+    return cut
+
 async def send_draft(bot,db,draft,cid,lang,premium):
     text=draft["text"] or ""
     if not premium and draft["attribution"]:
         attr=await db.getset(f"attr_{lang}",tr(lang,"attr"))
-        text=(text+"\n\n"+attr).strip()
+        text=(text+"\n\n"+html.escape(attr,quote=False)).strip()
     markup=await build_markup(db,draft["id"])
     if draft["media_type"]=="photo":
-        msg=await bot.send_photo(cid,draft["file_id"],caption=text[:1024],reply_markup=markup)
+        msg=await bot.send_photo(cid,draft["file_id"],caption=html_safe_truncate(text,1024),reply_markup=markup,parse_mode="HTML")
     elif draft["media_type"]=="video":
-        msg=await bot.send_video(cid,draft["file_id"],caption=text[:1024],reply_markup=markup)
+        msg=await bot.send_video(cid,draft["file_id"],caption=html_safe_truncate(text,1024),reply_markup=markup,parse_mode="HTML")
     else:
-        msg=await bot.send_message(cid,text or " ",reply_markup=markup)
+        msg=await bot.send_message(cid,text or " ",reply_markup=markup,parse_mode="HTML")
     await db.savepub(draft["user_id"],draft["id"],cid,msg.message_id)
     return msg
 
@@ -571,7 +590,10 @@ async def media(m:Message,state:FSMContext):
 
 @dp.message(S.text)
 async def post_text(m:Message,state:FSMContext):
-    data=await state.get_data();did=data["did"];text="" if (m.text or "").strip().lower()=="/skip" else (m.text or "")
+    data=await state.get_data();did=data["did"]
+    # Use html_text (not plain text) so formatting and Telegram Premium custom emoji
+    # entities survive being saved and re-sent later.
+    text="" if (m.text or "").strip().lower()=="/skip" else (m.html_text or "")
     await db.upd(did,text=text);await state.set_state(None);await state.update_data(did=did);lang=await lang_of(m.from_user.id)
     prem=await db.premium(m.from_user.id);await m.answer(tr(lang,"ready"),reply_markup=kb_draft(lang,prem))
 
@@ -640,11 +662,11 @@ async def preview(c:CallbackQuery):
     if not did: await c.answer("No draft");return
     d=await db.getdraft(did);prem=await db.premium(c.from_user.id)
     text=d["text"] or ""
-    if not prem and d["attribution"]:text=(text+"\n\n"+await db.getset(f"attr_{lang}",tr(lang,"attr"))).strip()
+    if not prem and d["attribution"]:text=(text+"\n\n"+html.escape(await db.getset(f"attr_{lang}",tr(lang,"attr")),quote=False)).strip()
     markup=await build_markup(db,did)
-    if d["media_type"]=="photo":await c.message.answer_photo(d["file_id"],caption=text[:1024],reply_markup=markup)
-    elif d["media_type"]=="video":await c.message.answer_video(d["file_id"],caption=text[:1024],reply_markup=markup)
-    else:await c.message.answer(text or " ",reply_markup=markup)
+    if d["media_type"]=="photo":await c.message.answer_photo(d["file_id"],caption=html_safe_truncate(text,1024),reply_markup=markup,parse_mode="HTML")
+    elif d["media_type"]=="video":await c.message.answer_video(d["file_id"],caption=html_safe_truncate(text,1024),reply_markup=markup,parse_mode="HTML")
+    else:await c.message.answer(text or " ",reply_markup=markup,parse_mode="HTML")
     await c.answer()
 
 @dp.callback_query(F.data=="post:buttons")
@@ -717,10 +739,25 @@ async def btn_row(m:Message,state:FSMContext):
     did=data.get("did")
     if not did:
         did=await db.draft(m.from_user.id);await state.update_data(did=did)
-    style="success" if (data.get("btntext") or "").strip().upper()=="START" else "primary"
-    await db.addbtn(did,row,data.get("btntext", "Button"),data.get("btnurl", ""),"",style)
-    await state.set_state(None);await state.update_data(did=did)
-    lang=await lang_of(m.from_user.id);await m.answer(tr(lang,"saved"),reply_markup=kb_draft(lang,await db.premium(m.from_user.id)))
+    await state.update_data(did=did,btnrow=row)
+    await state.set_state(None)
+    lang=await lang_of(m.from_user.id);await m.answer(tr(lang,"btncolor"),reply_markup=kb_btncolor(lang,"btn:coloradd"))
+
+@dp.callback_query(F.data.startswith("btn:coloradd:"))
+async def btn_color_add(c:CallbackQuery,state:FSMContext):
+    style=c.data.split(":")[-1]
+    if style not in ("primary","success","danger"):return await c.answer("❌",show_alert=True)
+    data=await state.get_data()
+    did=data.get("did")
+    if not did:
+        did=await db.draft(c.from_user.id);await state.update_data(did=did)
+    row=data.get("btnrow",1)
+    await db.addbtn(did,row,data.get("btntext","Button"),data.get("btnurl",""),"",style)
+    await state.update_data(did=did)
+    lang=await lang_of(c.from_user.id)
+    await c.message.edit_text(tr(lang,"saved"))
+    await c.message.answer(tr(lang,"ready"),reply_markup=kb_draft(lang,await db.premium(c.from_user.id)))
+    await c.answer()
 
 @dp.callback_query(F.data.startswith("btn:edit:"))
 async def btn_edit(c:CallbackQuery,state:FSMContext):
@@ -743,14 +780,27 @@ async def btn_edit_text(m:Message,state:FSMContext):
 async def btn_edit_url(m:Message,state:FSMContext):
     if not (m.text or "").startswith(("http://","https://")):
         return await m.answer("URL must start with http:// or https://")
-    data=await state.get_data()
+    await state.update_data(btnediturl=m.text)
+    await state.set_state(None)
+    lang=await lang_of(m.from_user.id)
+    await m.answer(tr(lang,"btncolor"),reply_markup=kb_btncolor(lang,"btn:coloredit"))
+
+@dp.callback_query(F.data.startswith("btn:coloredit:"))
+async def btn_color_edit(c:CallbackQuery,state:FSMContext):
+    style=c.data.split(":")[-1]
+    if style not in ("primary","success","danger"):return await c.answer("❌",show_alert=True)
+    data=await state.get_data();bid=data.get("bid")
+    if not bid:return await c.answer("❌",show_alert=True)
     async with aiosqlite.connect(DB_PATH) as d:
-        await d.execute("UPDATE buttons SET text=?,url=? WHERE id=?",(data.get("btntext",""),m.text,data["bid"]))
+        await d.execute("UPDATE buttons SET text=?,url=?,style=? WHERE id=?",
+                         (data.get("btntext",""),data.get("btnediturl",""),style,bid))
         await d.commit()
     did=data.get("did")
-    await state.set_state(None)
     if did: await state.update_data(did=did)
-    lang=await lang_of(m.from_user.id); await m.answer(tr(lang,"saved"),reply_markup=kb_draft(lang,await db.premium(m.from_user.id)) if did else kb_main(lang,m.from_user.id==ADMIN_ID))
+    lang=await lang_of(c.from_user.id)
+    await c.message.edit_text(tr(lang,"saved"))
+    await c.message.answer(tr(lang,"ready"),reply_markup=kb_draft(lang,await db.premium(c.from_user.id)) if did else kb_main(lang,c.from_user.id==ADMIN_ID))
+    await c.answer()
 
 @dp.callback_query(F.data.startswith("btn:del:"))
 async def btn_del(c:CallbackQuery):
@@ -1005,10 +1055,11 @@ async def pub_edit(c:CallbackQuery,state:FSMContext):
 @dp.message(S.edittext)
 async def edittext(m:Message,state:FSMContext):
     lang=await lang_of(m.from_user.id);data=await state.get_data()
+    newtext=m.html_text or ""
     try:
-        await m.bot.edit_message_caption(chat_id=data["chat_id"],message_id=data["message_id"],caption=m.text)
+        await m.bot.edit_message_caption(chat_id=data["chat_id"],message_id=data["message_id"],caption=html_safe_truncate(newtext,1024),parse_mode="HTML")
     except:
-        try:await m.bot.edit_message_text(chat_id=data["chat_id"],message_id=data["message_id"],text=m.text)
+        try:await m.bot.edit_message_text(chat_id=data["chat_id"],message_id=data["message_id"],text=newtext,parse_mode="HTML")
         except Exception as e:await m.answer("❌ "+str(e)[:300]);return
     await state.clear();await m.answer(tr(lang,"saved"))
 
