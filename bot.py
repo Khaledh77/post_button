@@ -1,5 +1,5 @@
 
-import asyncio, os, json, html
+import asyncio, os, json, html, re
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -9,6 +9,7 @@ import aiosqlite
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -335,6 +336,13 @@ class DB:
         async with aiosqlite.connect(self.path) as d:
             d.row_factory=aiosqlite.Row
             c=await d.execute("SELECT * FROM drafts WHERE user_id=? AND COALESCE(saved,0)=1 ORDER BY updated_at DESC,id DESC LIMIT ?",(uid,limit));return await c.fetchall()
+    async def delete_draft(self,i,uid):
+        async with aiosqlite.connect(self.path) as d:
+            c=await d.execute("SELECT 1 FROM drafts WHERE id=? AND user_id=?",(i,uid))
+            if not await c.fetchone():return False
+            await d.execute("DELETE FROM buttons WHERE draft_id=?",(i,))
+            await d.execute("DELETE FROM drafts WHERE id=? AND user_id=?",(i,uid))
+            await d.commit();return True
     async def upd(self,i,**kw):
         allowed={"media_type","file_id","text","attribution"};kw={k:v for k,v in kw.items() if k in allowed}
         if not kw:return
@@ -391,27 +399,71 @@ async def build_markup(db,did):
         rows.setdefault(int(b["row_no"]),[]).append(InlineKeyboardButton(**kwargs))
     return InlineKeyboardMarkup(inline_keyboard=[rows[k] for k in sorted(rows)]) if rows else None
 
+_TAG_RE=re.compile(r"<(/?)([a-zA-Z0-9-]+)(\s[^<>]*?)?/?>")
+_VOID_TAGS={"br","hr","img"}
+
+def html_close_open(s):
+    # Close any tags left open (e.g. <blockquote> without </blockquote>), otherwise Telegram
+    # replies with: can't parse entities: Can't find end tag corresponding to start tag.
+    stack=[]
+    for m in _TAG_RE.finditer(s):
+        closing,name=m.group(1),m.group(2).lower()
+        if name in _VOID_TAGS:continue
+        if closing:
+            if name in stack:
+                while stack:
+                    if stack.pop()==name:break
+        else:
+            stack.append(name)
+    return s+"".join(f"</{t}>" for t in reversed(stack))
+
 def html_safe_truncate(s,limit):
-    # Truncate HTML (used for parse_mode="HTML" captions/text) without cutting a tag in half,
-    # e.g. a <tg-emoji emoji-id="..."> tag that carries a Premium custom emoji.
-    if len(s)<=limit:return s
-    cut=s[:limit]
-    last_lt=cut.rfind("<");last_gt=cut.rfind(">")
-    if last_lt>last_gt:cut=cut[:last_lt]
-    return cut
+    # Cut HTML to `limit` VISIBLE characters (tags themselves do not count towards Telegram's
+    # caption limit), never splitting a tag, and always closing whatever stays open.
+    if not s:return s
+    out=[];visible=0;i=0;n=len(s)
+    while i<n:
+        if s[i]=="<":
+            m=_TAG_RE.match(s,i)
+            if m:
+                out.append(m.group(0));i=m.end();continue
+        if visible>=limit:break
+        out.append(s[i]);visible+=1;i+=1
+    return html_close_open("".join(out))
+
+def html_to_plain(s):
+    # Fallback for when Telegram refuses the HTML: drop the tags, keep the words.
+    return html.unescape(_TAG_RE.sub("",s or ""))
+
+def draft_text(draft,lang,premium,attr):
+    text=draft["text"] or ""
+    if not premium and draft["attribution"] and attr:
+        text=(text+"\n\n"+html.escape(attr,quote=False)).strip()
+    return text
+
+async def send_post(bot,cid,media_type,file_id,text,markup):
+    # Always try the formatted (HTML) version first; if Telegram rejects the markup for any
+    # reason, resend the same post as plain text instead of failing the publish completely.
+    if media_type=="photo":
+        try:
+            return await bot.send_photo(cid,file_id,caption=html_safe_truncate(text,1024),reply_markup=markup,parse_mode="HTML")
+        except TelegramBadRequest:
+            return await bot.send_photo(cid,file_id,caption=html_to_plain(text)[:1024],reply_markup=markup)
+    if media_type=="video":
+        try:
+            return await bot.send_video(cid,file_id,caption=html_safe_truncate(text,1024),reply_markup=markup,parse_mode="HTML")
+        except TelegramBadRequest:
+            return await bot.send_video(cid,file_id,caption=html_to_plain(text)[:1024],reply_markup=markup)
+    try:
+        return await bot.send_message(cid,html_safe_truncate(text,4096) or " ",reply_markup=markup,parse_mode="HTML")
+    except TelegramBadRequest:
+        return await bot.send_message(cid,html_to_plain(text)[:4096] or " ",reply_markup=markup)
 
 async def send_draft(bot,db,draft,cid,lang,premium):
-    text=draft["text"] or ""
-    if not premium and draft["attribution"]:
-        attr=await db.getset(f"attr_{lang}",tr(lang,"attr"))
-        text=(text+"\n\n"+html.escape(attr,quote=False)).strip()
+    attr=await db.getset(f"attr_{lang}",tr(lang,"attr"))
+    text=draft_text(draft,lang,premium,attr)
     markup=await build_markup(db,draft["id"])
-    if draft["media_type"]=="photo":
-        msg=await bot.send_photo(cid,draft["file_id"],caption=html_safe_truncate(text,1024),reply_markup=markup,parse_mode="HTML")
-    elif draft["media_type"]=="video":
-        msg=await bot.send_video(cid,draft["file_id"],caption=html_safe_truncate(text,1024),reply_markup=markup,parse_mode="HTML")
-    else:
-        msg=await bot.send_message(cid,text or " ",reply_markup=markup,parse_mode="HTML")
+    msg=await send_post(bot,cid,draft["media_type"],draft["file_id"],text,markup)
     await db.savepub(draft["user_id"],draft["id"],cid,msg.message_id)
     return msg
 
@@ -465,7 +517,7 @@ async def cmd_new(m:Message,state:FSMContext):
 
 @dp.message(Command("saved"))
 async def cmd_saved(m:Message):
-    lang=await lang_of(m.from_user.id);rows=await db.saved_drafts(m.from_user.id);kb=[[InlineKeyboardButton(text="🗂 "+(r["title"] or r["text"] or "Post")[:45],callback_data=f"saved:open:{r['id']}")] for r in rows];kb.append([InlineKeyboardButton(text=tr(lang,"back"),callback_data="home")]);await m.answer(tr(lang,"saved_posts"),reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    lang=await lang_of(m.from_user.id);rows=await db.saved_drafts(m.from_user.id);kb=[[InlineKeyboardButton(text="🗂 "+(html_to_plain(r["title"] or r["text"] or "Post")[:45] or "Post"),callback_data=f"saved:open:{r['id']}")] for r in rows];kb.append([InlineKeyboardButton(text=tr(lang,"back"),callback_data="home")]);await m.answer(tr(lang,"saved_posts"),reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @dp.message(CommandStart())
 async def start(m:Message,state:FSMContext):
@@ -604,7 +656,7 @@ async def saved_save(c:CallbackQuery,state:FSMContext):
         return await c.answer("❌",show_alert=True)
     lang=await lang_of(c.from_user.id)
     d=await db.getdraft(did)
-    title=(d["text"] or "").replace("\n"," ").strip()[:50] or "Post"
+    title=html_to_plain(d["text"] or "").replace("\n"," ").strip()[:50] or "Post"
     await db.save_draft_title(did,title)
     await c.answer("✅")
     await c.message.edit_text("💾 "+title,reply_markup=kb_main(lang,c.from_user.id==ADMIN_ID))
@@ -619,23 +671,27 @@ async def saved_list(c:CallbackQuery):
     lang=await lang_of(c.from_user.id);rows=await db.saved_drafts(c.from_user.id)
     kb=[]
     if not rows:
-        await c.message.edit_text(tr(lang,"saved_posts")+"\n\n"+saved_action_text(lang,"empty"),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=tr(lang,"back"),callback_data="home")]]))
+        try:
+            await c.message.edit_text(tr(lang,"saved_posts")+"\n\n"+saved_action_text(lang,"empty"),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=tr(lang,"back"),callback_data="home")]]))
+        except TelegramBadRequest:pass
         return
     for r in rows:
-        title=(r["title"] or r["text"] or "Post").replace("\n"," ").strip()[:42]
+        title=(html_to_plain(r["title"] or r["text"] or "Post")).replace("\n"," ").strip()[:42] or "Post"
         kb.append([
             InlineKeyboardButton(text="📂 "+title,callback_data=f"saved:open:{r['id']}"),
             InlineKeyboardButton(text="🗑",callback_data=f"saved:del:{r['id']}")
         ])
     kb.append([InlineKeyboardButton(text=saved_action_text(lang,"delete_all"),callback_data="saved:clear")])
     kb.append([InlineKeyboardButton(text=tr(lang,"back"),callback_data="home")])
-    await c.message.edit_text(tr(lang,"saved_posts"),reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    try:
+        await c.message.edit_text(tr(lang,"saved_posts"),reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    except TelegramBadRequest:pass
 
 @dp.callback_query(F.data.startswith("saved:del:"))
 async def saved_delete(c:CallbackQuery):
     did=int(c.data.split(":")[-1])
-    await db.delete_draft(did,c.from_user.id)
-    await c.answer("🗑 Ўчирилди")
+    ok=await db.delete_draft(did,c.from_user.id)
+    await c.answer("🗑 Ўчирилди" if ok else "❌")
     await saved_list(c)
 
 @dp.callback_query(F.data=="saved:clear")
@@ -661,12 +717,13 @@ async def preview(c:CallbackQuery):
     st=await s.get_data();did=st.get("did")
     if not did: await c.answer("No draft");return
     d=await db.getdraft(did);prem=await db.premium(c.from_user.id)
-    text=d["text"] or ""
-    if not prem and d["attribution"]:text=(text+"\n\n"+html.escape(await db.getset(f"attr_{lang}",tr(lang,"attr")),quote=False)).strip()
+    attr=await db.getset(f"attr_{lang}",tr(lang,"attr"))
+    text=draft_text(d,lang,prem,attr)
     markup=await build_markup(db,did)
-    if d["media_type"]=="photo":await c.message.answer_photo(d["file_id"],caption=html_safe_truncate(text,1024),reply_markup=markup,parse_mode="HTML")
-    elif d["media_type"]=="video":await c.message.answer_video(d["file_id"],caption=html_safe_truncate(text,1024),reply_markup=markup,parse_mode="HTML")
-    else:await c.message.answer(text or " ",reply_markup=markup,parse_mode="HTML")
+    try:
+        await send_post(c.bot,c.from_user.id,d["media_type"],d["file_id"],text,markup)
+    except Exception as e:
+        await c.message.answer("❌ "+str(e)[:300])
     await c.answer()
 
 @dp.callback_query(F.data=="post:buttons")
@@ -817,6 +874,13 @@ async def post_back(c:CallbackQuery):
     s=dp.fsm.get_context(bot=c.bot,chat_id=c.from_user.id,user_id=c.from_user.id);did=(await s.get_data()).get("did")
     lang=await lang_of(c.from_user.id);await c.message.edit_text(tr(lang,"ready"),reply_markup=kb_draft(lang,await db.premium(c.from_user.id)))
 
+def kb_dest_select(lang,dests,sel):
+    rows=[[InlineKeyboardButton(text=("✅ " if d["id"] in sel else "☐ ")+(d["title"] or str(d["chat_id"])),
+                                callback_data=f"sel:{d['id']}")] for d in dests]
+    rows.append([InlineKeyboardButton(text=tr(lang,"publish"),callback_data="publish:go")])
+    rows.append([InlineKeyboardButton(text=tr(lang,"back"),callback_data="post:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 @dp.callback_query(F.data=="post:choose")
 async def choose_publish(c:CallbackQuery):
     lang=await lang_of(c.from_user.id);dests=await db.dests(c.from_user.id)
@@ -824,19 +888,24 @@ async def choose_publish(c:CallbackQuery):
     prem=await db.premium(c.from_user.id)
     if not prem:dests=dests[:1]
     s=dp.fsm.get_context(bot=c.bot,chat_id=c.from_user.id,user_id=c.from_user.id);await s.update_data(selected=[])
-    rows=[[InlineKeyboardButton(text=f"☐ {d['title']}",callback_data=f"sel:{d['id']}")] for d in dests]
-    rows.append([InlineKeyboardButton(text=tr(lang,"publish"),callback_data="publish:go")])
-    await c.message.edit_text(tr(lang,"publish_choose"),reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await c.message.edit_text(tr(lang,"publish_choose"),reply_markup=kb_dest_select(lang,dests,[]))
 
 @dp.callback_query(F.data.startswith("sel:"))
 async def select_dest(c:CallbackQuery):
-    s=dp.fsm.get_context(bot=c.bot,chat_id=c.from_user.id,user_id=c.from_user.id);data=await s.get_data();sel=data.get("selected",[])
+    lang=await lang_of(c.from_user.id)
+    s=dp.fsm.get_context(bot=c.bot,chat_id=c.from_user.id,user_id=c.from_user.id);data=await s.get_data();sel=list(data.get("selected",[]))
     i=int(c.data.split(":")[-1])
+    prem=await db.premium(c.from_user.id)
     if i in sel:sel.remove(i)
-    else:
-        if not await db.premium(c.from_user.id):sel=[i]
-        else:sel.append(i)
-    await s.update_data(selected=sel);await c.answer("☑️")
+    elif not prem:sel=[i]          # free plan: exactly one destination
+    else:sel.append(i)
+    await s.update_data(selected=sel)
+    dests=await db.dests(c.from_user.id)
+    if not prem:dests=dests[:1]
+    # Redraw the keyboard so the chosen destination visibly shows ✅
+    try:await c.message.edit_reply_markup(reply_markup=kb_dest_select(lang,dests,sel))
+    except TelegramBadRequest:pass
+    await c.answer("✅" if i in sel else "☐")
 
 @dp.callback_query(F.data=="publish:go")
 async def publish_go(c:CallbackQuery):
@@ -1059,8 +1128,12 @@ async def edittext(m:Message,state:FSMContext):
     try:
         await m.bot.edit_message_caption(chat_id=data["chat_id"],message_id=data["message_id"],caption=html_safe_truncate(newtext,1024),parse_mode="HTML")
     except:
-        try:await m.bot.edit_message_text(chat_id=data["chat_id"],message_id=data["message_id"],text=newtext,parse_mode="HTML")
-        except Exception as e:await m.answer("❌ "+str(e)[:300]);return
+        try:await m.bot.edit_message_text(chat_id=data["chat_id"],message_id=data["message_id"],text=html_safe_truncate(newtext,4096),parse_mode="HTML")
+        except:
+            try:await m.bot.edit_message_caption(chat_id=data["chat_id"],message_id=data["message_id"],caption=html_to_plain(newtext)[:1024])
+            except:
+                try:await m.bot.edit_message_text(chat_id=data["chat_id"],message_id=data["message_id"],text=html_to_plain(newtext)[:4096])
+                except Exception as e:await m.answer("❌ "+str(e)[:300]);return
     await state.clear();await m.answer(tr(lang,"saved"))
 
 @dp.callback_query(F.data=="cancel")
