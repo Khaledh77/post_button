@@ -15,7 +15,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputMediaPhoto, InputMediaVideo, BotCommand, ReplyKeyboardMarkup, KeyboardButton
+    InputMediaPhoto, InputMediaVideo, BotCommand, ReplyKeyboardMarkup, KeyboardButton,
+    MessageEntity
 )
 
 load_dotenv(Path(__file__).with_name(".env"))
@@ -238,7 +239,7 @@ class DB:
               id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT UNIQUE, title TEXT, kind TEXT, enabled INTEGER DEFAULT 1, created_at TEXT);
             CREATE TABLE IF NOT EXISTS drafts(
               id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,title TEXT DEFAULT '',media_type TEXT,file_id TEXT,text TEXT,attribution INTEGER DEFAULT 1,created_at TEXT,updated_at TEXT,
-              src_chat_id TEXT DEFAULT '',src_msg_id INTEGER DEFAULT 0);
+              src_chat_id TEXT DEFAULT '',src_msg_id INTEGER DEFAULT 0,entities TEXT DEFAULT '');
             CREATE TABLE IF NOT EXISTS buttons(
               id INTEGER PRIMARY KEY AUTOINCREMENT,draft_id INTEGER,row_no INTEGER,position INTEGER,text TEXT,url TEXT,icon_custom_emoji_id TEXT DEFAULT '',style TEXT DEFAULT 'primary');
             CREATE TABLE IF NOT EXISTS published(
@@ -257,6 +258,9 @@ class DB:
                 # Premium custom emoji (a bot may not author custom_emoji entities itself).
                 "ALTER TABLE drafts ADD COLUMN src_chat_id TEXT DEFAULT ''",
                 "ALTER TABLE drafts ADD COLUMN src_msg_id INTEGER DEFAULT 0",
+                # Message entities (bold, links, Premium custom emoji...) kept as JSON. Telegram
+                # accepts these directly, which is the only way a bot can send Premium emoji.
+                "ALTER TABLE drafts ADD COLUMN entities TEXT DEFAULT ''",
             ):
                 try:
                     await d.execute(sql)
@@ -349,7 +353,7 @@ class DB:
             await d.execute("DELETE FROM drafts WHERE id=? AND user_id=?",(i,uid))
             await d.commit();return True
     async def upd(self,i,**kw):
-        allowed={"media_type","file_id","text","attribution","src_chat_id","src_msg_id"};kw={k:v for k,v in kw.items() if k in allowed}
+        allowed={"media_type","file_id","text","attribution","src_chat_id","src_msg_id","entities"};kw={k:v for k,v in kw.items() if k in allowed}
         if not kw:return
         kw["updated_at"]=datetime.now(timezone.utc).isoformat()
         q=",".join(f"{k}=?" for k in kw)
@@ -440,29 +444,78 @@ def html_to_plain(s):
     # Fallback for when Telegram refuses the HTML: drop the tags, keep the words.
     return html.unescape(_TAG_RE.sub("",s or ""))
 
-def draft_text(draft,lang,premium,attr):
-    text=draft["text"] or ""
-    if not premium and draft["attribution"] and attr:
-        text=(text+"\n\n"+html.escape(attr,quote=False)).strip()
-    return text
+def dump_entities(ents):
+    if not ents:return ""
+    try:return json.dumps([e.model_dump(exclude_none=True,mode="json") for e in ents],ensure_ascii=False)
+    except Exception:return ""
 
-async def send_post(bot,cid,media_type,file_id,text,markup):
-    # Always try the formatted (HTML) version first; if Telegram rejects the markup for any
-    # reason, resend the same post as plain text instead of failing the publish completely.
-    if media_type=="photo":
-        try:
-            return await bot.send_photo(cid,file_id,caption=html_safe_truncate(text,1024),reply_markup=markup,parse_mode="HTML")
-        except TelegramBadRequest:
-            return await bot.send_photo(cid,file_id,caption=html_to_plain(text)[:1024],reply_markup=markup)
-    if media_type=="video":
-        try:
-            return await bot.send_video(cid,file_id,caption=html_safe_truncate(text,1024),reply_markup=markup,parse_mode="HTML")
-        except TelegramBadRequest:
-            return await bot.send_video(cid,file_id,caption=html_to_plain(text)[:1024],reply_markup=markup)
+def load_entities(raw):
+    if not raw:return None
     try:
-        return await bot.send_message(cid,html_safe_truncate(text,4096) or " ",reply_markup=markup,parse_mode="HTML")
-    except TelegramBadRequest:
-        return await bot.send_message(cid,html_to_plain(text)[:4096] or " ",reply_markup=markup)
+        data=json.loads(raw)
+        ents=[MessageEntity.model_validate(x) for x in data]
+        return ents or None
+    except Exception:
+        return None
+
+def u16len(s):
+    # Telegram measures text length and entity offsets in UTF-16 code units.
+    return len((s or "").encode("utf-16-le"))//2
+
+def clip_entities(text,ents,limit):
+    # Cut text to `limit` UTF-16 units and shrink/drop entities so their offsets stay valid.
+    text=text or ""
+    if u16len(text)<=limit:return text,(ents or None)
+    raw=text.encode("utf-16-le")[:limit*2]
+    try:cut=raw.decode("utf-16-le")
+    except UnicodeDecodeError:cut=raw[:-2].decode("utf-16-le")   # never split a surrogate pair
+    out=[]
+    for e in (ents or []):
+        if e.offset>=limit:continue
+        ln=min(e.offset+e.length,limit)-e.offset
+        if ln<=0:continue
+        d=e.model_dump(exclude_none=True,mode="json");d["length"]=ln
+        try:out.append(MessageEntity.model_validate(d))
+        except Exception:pass
+    return cut,(out or None)
+
+def draft_body(draft,premium,attr):
+    """Returns (text, entities, legacy_html) for a draft.
+
+    New drafts store plain text + entities (the only way a bot can send Premium custom emoji).
+    Drafts written by the previous version store HTML in `text` and have no entities."""
+    text=draft["text"] or ""
+    ents=load_entities(draft["entities"] if "entities" in draft.keys() else "")
+    legacy=(ents is None and "<" in text)
+    if not premium and draft["attribution"] and attr:
+        # The attribution line is appended at the end, so existing entity offsets stay valid.
+        text=(text+"\n\n"+(html.escape(attr,quote=False) if legacy else attr)).strip()
+    return text,ents,legacy
+
+async def send_post(bot,cid,media_type,file_id,text,ents=None,legacy=False,markup=None):
+    cap_limit,txt_limit=1024,4096
+    if ents:
+        # Native entities: Premium custom emoji, bold, links, quotes — all preserved, and there
+        # is no markup to mis-parse, so Telegram can never reject it with a parse error.
+        if media_type in ("photo","video"):
+            t,e=clip_entities(text,ents,cap_limit)
+            send=bot.send_photo if media_type=="photo" else bot.send_video
+            return await send(cid,file_id,caption=t,caption_entities=e,reply_markup=markup)
+        t,e=clip_entities(text,ents,txt_limit)
+        return await bot.send_message(cid,t or " ",entities=e,reply_markup=markup)
+    if legacy:
+        # Old draft stored as HTML: try to render it, fall back to plain text if it won't parse.
+        try:
+            if media_type in ("photo","video"):
+                send=bot.send_photo if media_type=="photo" else bot.send_video
+                return await send(cid,file_id,caption=html_safe_truncate(text,cap_limit),reply_markup=markup,parse_mode="HTML")
+            return await bot.send_message(cid,html_safe_truncate(text,txt_limit) or " ",reply_markup=markup,parse_mode="HTML")
+        except TelegramBadRequest:
+            text=html_to_plain(text)
+    if media_type in ("photo","video"):
+        send=bot.send_photo if media_type=="photo" else bot.send_video
+        return await send(cid,file_id,caption=clip_entities(text,None,cap_limit)[0],reply_markup=markup)
+    return await bot.send_message(cid,clip_entities(text,None,txt_limit)[0] or " ",reply_markup=markup)
 
 def draft_src(draft):
     # (chat_id, message_id) of the user's original message, when the whole post came from
@@ -474,30 +527,23 @@ def draft_src(draft):
         return None
     return (sc,sm) if sc and sm else None
 
-async def publish_post(bot,draft,cid,text,markup):
-    # Telegram does not let a bot author custom_emoji entities, so a post written with Premium
-    # emoji loses them when the bot re-sends the text itself. copyMessage duplicates the user's
-    # original message server-side, keeping every entity (Premium emoji included) intact.
-    src=draft_src(draft)
-    if src:
-        try:
-            r=await bot.copy_message(chat_id=cid,from_chat_id=src[0],message_id=src[1],reply_markup=markup)
-            return r.message_id
-        except TelegramBadRequest:
-            pass
-    msg=await send_post(bot,cid,draft["media_type"],draft["file_id"],text,markup)
-    return msg.message_id
+async def publish_post(bot,draft,cid,text,ents,legacy,markup):
+    try:
+        msg=await send_post(bot,cid,draft["media_type"],draft["file_id"],text,ents,legacy,markup)
+        return msg.message_id
+    except TelegramBadRequest:
+        # Last resort for an old draft whose stored markup Telegram refuses: copy the user's
+        # original message instead, which keeps its formatting and Premium emoji untouched.
+        src=draft_src(draft)
+        if not src:raise
+        r=await bot.copy_message(chat_id=cid,from_chat_id=src[0],message_id=src[1],reply_markup=markup)
+        return r.message_id
 
 async def send_draft(bot,db,draft,cid,lang,premium):
     attr=await db.getset(f"attr_{lang}",tr(lang,"attr"))
-    text=draft_text(draft,lang,premium,attr)
+    text,ents,legacy=draft_body(draft,premium,attr)
     markup=await build_markup(db,draft["id"])
-    # A free-plan post needs the attribution line appended, which a plain copy cannot carry.
-    use_copy=premium or not draft["attribution"]
-    if use_copy:
-        mid=await publish_post(bot,draft,cid,text,markup)
-    else:
-        mid=(await send_post(bot,cid,draft["media_type"],draft["file_id"],text,markup)).message_id
+    mid=await publish_post(bot,draft,cid,text,ents,legacy,markup)
     await db.savepub(draft["user_id"],draft["id"],cid,mid)
     return mid
 
@@ -698,9 +744,10 @@ async def media(m:Message,state:FSMContext):
     else:
         await m.answer(tr(lang,"media"));return
     if (m.photo or m.video) and m.caption:
-        # Photo/video sent together with its caption: remember this exact message so the post can
-        # be copied 1:1 later — that is what keeps Premium emoji and formatting alive.
-        await db.upd(did,text=m.html_text or "",src_chat_id=str(m.chat.id),src_msg_id=m.message_id)
+        # Photo/video sent together with its caption: keep the caption and its entities as they
+        # arrived (Premium emoji included), plus the source message as a copy-fallback.
+        await db.upd(did,text=m.caption or "",entities=dump_entities(m.caption_entities),
+                     src_chat_id=str(m.chat.id),src_msg_id=m.message_id)
         await state.set_state(None);await state.update_data(did=did)
         prem=await db.premium(m.from_user.id)
         await m.answer(tr(lang,"ready"),reply_markup=kb_draft(lang,prem));return
@@ -711,16 +758,15 @@ async def post_text(m:Message,state:FSMContext):
     data=await state.get_data();did=data["did"]
     lang=await lang_of(m.from_user.id)
     if (m.text or "").strip().lower()=="/skip":
-        # Keep whatever text the draft already has (e.g. a caption captured with the media).
-        await db.upd(did,text="",src_chat_id="",src_msg_id=0)
+        await db.upd(did,text="",entities="",src_chat_id="",src_msg_id=0)
     else:
         d=await db.getdraft(did)
-        # Text-only post: the message itself can be copied later, keeping Premium emoji.
-        # Media + separate text cannot be copied as one message, so no source is stored.
-        if d and not d["media_type"]:
-            await db.upd(did,text=m.html_text or "",src_chat_id=str(m.chat.id),src_msg_id=m.message_id)
-        else:
-            await db.upd(did,text=m.html_text or "",src_chat_id="",src_msg_id=0)
+        # Store the text exactly as typed plus its entities — this is what carries Premium
+        # custom emoji through to the channel. The source message is kept as a copy-fallback
+        # only when the whole post is that single message (no separate media).
+        src=(str(m.chat.id),m.message_id) if (d and not d["media_type"]) else ("",0)
+        await db.upd(did,text=m.text or "",entities=dump_entities(m.entities),
+                     src_chat_id=src[0],src_msg_id=src[1])
     await state.set_state(None);await state.update_data(did=did)
     prem=await db.premium(m.from_user.id);await m.answer(tr(lang,"ready"),reply_markup=kb_draft(lang,prem))
 
@@ -793,13 +839,10 @@ async def preview(c:CallbackQuery):
     if not did: await c.answer("No draft");return
     d=await db.getdraft(did);prem=await db.premium(c.from_user.id)
     attr=await db.getset(f"attr_{lang}",tr(lang,"attr"))
-    text=draft_text(d,lang,prem,attr)
+    text,ents,legacy=draft_body(d,prem,attr)
     markup=await build_markup(db,did)
     try:
-        if prem or not d["attribution"]:
-            await publish_post(c.bot,d,c.from_user.id,text,markup)
-        else:
-            await send_post(c.bot,c.from_user.id,d["media_type"],d["file_id"],text,markup)
+        await publish_post(c.bot,d,c.from_user.id,text,ents,legacy,markup)
     except Exception as e:
         await c.message.answer("❌ "+str(e)[:300])
     await c.answer()
@@ -1202,16 +1245,16 @@ async def pub_edit(c:CallbackQuery,state:FSMContext):
 @dp.message(S.edittext)
 async def edittext(m:Message,state:FSMContext):
     lang=await lang_of(m.from_user.id);data=await state.get_data()
-    newtext=m.html_text or ""
+    # Keep the entities of the new text so Premium emoji survive the edit as well.
+    raw=m.text or m.caption or ""
+    ents=m.entities or m.caption_entities
+    cap,cap_e=clip_entities(raw,ents,1024)
+    txt,txt_e=clip_entities(raw,ents,4096)
     try:
-        await m.bot.edit_message_caption(chat_id=data["chat_id"],message_id=data["message_id"],caption=html_safe_truncate(newtext,1024),parse_mode="HTML")
+        await m.bot.edit_message_caption(chat_id=data["chat_id"],message_id=data["message_id"],caption=cap,caption_entities=cap_e)
     except:
-        try:await m.bot.edit_message_text(chat_id=data["chat_id"],message_id=data["message_id"],text=html_safe_truncate(newtext,4096),parse_mode="HTML")
-        except:
-            try:await m.bot.edit_message_caption(chat_id=data["chat_id"],message_id=data["message_id"],caption=html_to_plain(newtext)[:1024])
-            except:
-                try:await m.bot.edit_message_text(chat_id=data["chat_id"],message_id=data["message_id"],text=html_to_plain(newtext)[:4096])
-                except Exception as e:await m.answer("❌ "+str(e)[:300]);return
+        try:await m.bot.edit_message_text(chat_id=data["chat_id"],message_id=data["message_id"],text=txt,entities=txt_e)
+        except Exception as e:await m.answer("❌ "+str(e)[:300]);return
     await state.clear();await m.answer(tr(lang,"saved"))
 
 @dp.callback_query(F.data=="cancel")
