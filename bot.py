@@ -34,6 +34,7 @@ TRONGRID_KEY = os.getenv("TRONGRID_API_KEY","").strip()
 BEP20_USDT = os.getenv("BEP20_USDT_CONTRACT","").strip()
 TRC20_USDT = os.getenv("TRC20_USDT_CONTRACT","").strip()
 DB_PATH = os.getenv("DATABASE_PATH","data/post_button.sqlite3")
+BUILD = "2026-09-28-entities-v3"   # printed by /emojitest, so a stale running process is obvious
 
 LANGS = {
     "uz":"🇺🇿 O‘zbekcha", "tr":"🇹🇷 Türkçe", "ru":"🇷🇺 Русский",
@@ -266,6 +267,13 @@ class DB:
                     await d.execute(sql)
                 except Exception:
                     pass
+            # `fmt` tells the two storage formats apart with certainty: everything that already
+            # existed when this column appeared was written by the old HTML version.
+            try:
+                await d.execute("ALTER TABLE drafts ADD COLUMN fmt TEXT DEFAULT ''")
+                await d.execute("UPDATE drafts SET fmt='html'")
+            except Exception:
+                pass
             await d.commit()
     async def upsert(self,u):
         now=datetime.now(timezone.utc).isoformat()
@@ -353,7 +361,7 @@ class DB:
             await d.execute("DELETE FROM drafts WHERE id=? AND user_id=?",(i,uid))
             await d.commit();return True
     async def upd(self,i,**kw):
-        allowed={"media_type","file_id","text","attribution","src_chat_id","src_msg_id","entities"};kw={k:v for k,v in kw.items() if k in allowed}
+        allowed={"media_type","file_id","text","attribution","src_chat_id","src_msg_id","entities","fmt"};kw={k:v for k,v in kw.items() if k in allowed}
         if not kw:return
         kw["updated_at"]=datetime.now(timezone.utc).isoformat()
         q=",".join(f"{k}=?" for k in kw)
@@ -486,7 +494,10 @@ def draft_body(draft,premium,attr):
     Drafts written by the previous version store HTML in `text` and have no entities."""
     text=draft["text"] or ""
     ents=load_entities(draft["entities"] if "entities" in draft.keys() else "")
-    legacy=(ents is None and "<" in text)
+    fmt=(draft["fmt"] if "fmt" in draft.keys() else "") or ""
+    # Only drafts actually written by the old HTML version are rendered as HTML. A new draft is
+    # never treated as HTML, even if its text happens to contain a "<" character.
+    legacy=(fmt=="html")
     if not premium and draft["attribution"] and attr:
         # The attribution line is appended at the end, so existing entity offsets stay valid.
         text=(text+"\n\n"+(html.escape(attr,quote=False) if legacy else attr)).strip()
@@ -528,13 +539,19 @@ def draft_src(draft):
     return (sc,sm) if sc and sm else None
 
 async def publish_post(bot,draft,cid,text,ents,legacy,markup):
+    src=draft_src(draft)
+    # No entities but the original message is known (old draft, or a message whose entities
+    # could not be stored): copying it keeps the Premium emoji that a re-send would lose.
+    if src and not ents:
+        try:
+            r=await bot.copy_message(chat_id=cid,from_chat_id=src[0],message_id=src[1],reply_markup=markup)
+            return r.message_id
+        except TelegramBadRequest:
+            pass
     try:
         msg=await send_post(bot,cid,draft["media_type"],draft["file_id"],text,ents,legacy,markup)
         return msg.message_id
     except TelegramBadRequest:
-        # Last resort for an old draft whose stored markup Telegram refuses: copy the user's
-        # original message instead, which keeps its formatting and Premium emoji untouched.
-        src=draft_src(draft)
         if not src:raise
         r=await bot.copy_message(chat_id=cid,from_chat_id=src[0],message_id=src[1],reply_markup=markup)
         return r.message_id
@@ -610,19 +627,30 @@ async def cmd_emojitest(m:Message,state:FSMContext):
 @dp.message(S.emojitest)
 async def run_emojitest(m:Message,state:FSMContext):
     await state.clear()
-    ents=[e.type+(":"+str(e.custom_emoji_id) if e.type=="custom_emoji" else "") for e in (m.entities or m.caption_entities or [])]
-    await m.answer("📋 Entities: "+(", ".join(ents) or "йўқ")+"\n\nHTML:\n"+html.escape(m.html_text or "")[:800])
+    ents=m.entities or m.caption_entities
+    names=[e.type+(":"+str(e.custom_emoji_id) if e.type=="custom_emoji" else "") for e in (ents or [])]
+    custom=sum(1 for e in (ents or []) if e.type=="custom_emoji")
+    await m.answer(f"🏷 BUILD: {BUILD}\n📋 Entities: "+(", ".join(names) or "йўқ")+f"\n⭐ custom_emoji: {custom} та")
     res=[]
+    # A) here, in the private chat with the bot
     try:
-        await m.answer(m.html_text or " ",parse_mode="HTML");res.append("1️⃣ HTML: юборилди")
-    except Exception as e:res.append("1️⃣ HTML: ❌ "+str(e)[:150])
-    try:
-        await m.bot.send_message(m.chat.id,m.text or m.caption or " ",entities=(m.entities or m.caption_entities));res.append("2️⃣ entities: юборилди")
-    except Exception as e:res.append("2️⃣ entities: ❌ "+str(e)[:150])
-    try:
-        await m.bot.copy_message(chat_id=m.chat.id,from_chat_id=m.chat.id,message_id=m.message_id);res.append("3️⃣ copyMessage: юборилди")
-    except Exception as e:res.append("3️⃣ copyMessage: ❌ "+str(e)[:150])
-    await m.answer("\n".join(res)+"\n\n☝️ Юқоридаги 3 та хабардан қайси бирида Premium emoji ЖОНЛИ кўринса — ўшани ишлатамиз.")
+        await m.bot.send_message(m.chat.id,m.text or m.caption or " ",entities=ents)
+        res.append("1️⃣ БОТ ЧАТИДА: юборилди")
+    except Exception as e:res.append("1️⃣ БОТ ЧАТИДА: ❌ "+str(e)[:150])
+    # B) the same thing in every channel/group the user publishes to — this is the real target
+    for d in await db.dests(m.from_user.id):
+        title=d["title"] or str(d["chat_id"])
+        try:
+            await m.bot.send_message(d["chat_id"],m.text or m.caption or " ",entities=ents)
+            res.append(f"2️⃣ {title}: entities юборилди")
+        except Exception as e:
+            res.append(f"2️⃣ {title}: ❌ "+str(e)[:120])
+        try:
+            await m.bot.copy_message(chat_id=d["chat_id"],from_chat_id=m.chat.id,message_id=m.message_id)
+            res.append(f"3️⃣ {title}: copyMessage юборилди")
+        except Exception as e:
+            res.append(f"3️⃣ {title}: ❌ "+str(e)[:120])
+    await m.answer("\n".join(res)+"\n\n☝️ Энди КАНАЛГА кириб қаранг: 2️⃣ ва 3️⃣ хабарларда Premium emoji ЖОНЛИ кўриняптими? Натижани айтинг.")
 
 @dp.message(CommandStart())
 async def start(m:Message,state:FSMContext):
@@ -746,7 +774,7 @@ async def media(m:Message,state:FSMContext):
     if (m.photo or m.video) and m.caption:
         # Photo/video sent together with its caption: keep the caption and its entities as they
         # arrived (Premium emoji included), plus the source message as a copy-fallback.
-        await db.upd(did,text=m.caption or "",entities=dump_entities(m.caption_entities),
+        await db.upd(did,text=m.caption or "",entities=dump_entities(m.caption_entities),fmt="ent",
                      src_chat_id=str(m.chat.id),src_msg_id=m.message_id)
         await state.set_state(None);await state.update_data(did=did)
         prem=await db.premium(m.from_user.id)
@@ -758,14 +786,14 @@ async def post_text(m:Message,state:FSMContext):
     data=await state.get_data();did=data["did"]
     lang=await lang_of(m.from_user.id)
     if (m.text or "").strip().lower()=="/skip":
-        await db.upd(did,text="",entities="",src_chat_id="",src_msg_id=0)
+        await db.upd(did,text="",entities="",fmt="ent",src_chat_id="",src_msg_id=0)
     else:
         d=await db.getdraft(did)
         # Store the text exactly as typed plus its entities — this is what carries Premium
         # custom emoji through to the channel. The source message is kept as a copy-fallback
         # only when the whole post is that single message (no separate media).
         src=(str(m.chat.id),m.message_id) if (d and not d["media_type"]) else ("",0)
-        await db.upd(did,text=m.text or "",entities=dump_entities(m.entities),
+        await db.upd(did,text=m.text or "",entities=dump_entities(m.entities),fmt="ent",
                      src_chat_id=src[0],src_msg_id=src[1])
     await state.set_state(None);await state.update_data(did=did)
     prem=await db.premium(m.from_user.id);await m.answer(tr(lang,"ready"),reply_markup=kb_draft(lang,prem))
