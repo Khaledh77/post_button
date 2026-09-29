@@ -34,7 +34,7 @@ TRONGRID_KEY = os.getenv("TRONGRID_API_KEY","").strip()
 BEP20_USDT = os.getenv("BEP20_USDT_CONTRACT","").strip()
 TRC20_USDT = os.getenv("TRC20_USDT_CONTRACT","").strip()
 DB_PATH = os.getenv("DATABASE_PATH","data/post_button.sqlite3")
-BUILD = "2026-09-28-entities-v3"   # printed by /emojitest, so a stale running process is obvious
+BUILD = "2026-09-29-selfcheck-v4"   # printed by /emojitest, so a stale running process is obvious
 
 LANGS = {
     "uz":"🇺🇿 O‘zbekcha", "tr":"🇹🇷 Türkçe", "ru":"🇷🇺 Русский",
@@ -539,30 +539,39 @@ def draft_src(draft):
     return (sc,sm) if sc and sm else None
 
 async def publish_post(bot,draft,cid,text,ents,legacy,markup):
+    """Returns (message_id, emoji_kept) where emoji_kept is True/False when it could be
+    checked, or None when the post was copied (a copy returns only an id)."""
+    want=sum(1 for e in (ents or []) if e.type=="custom_emoji")
     src=draft_src(draft)
     # No entities but the original message is known (old draft, or a message whose entities
     # could not be stored): copying it keeps the Premium emoji that a re-send would lose.
     if src and not ents:
         try:
             r=await bot.copy_message(chat_id=cid,from_chat_id=src[0],message_id=src[1],reply_markup=markup)
-            return r.message_id
+            return r.message_id,None
         except TelegramBadRequest:
             pass
     try:
         msg=await send_post(bot,cid,draft["media_type"],draft["file_id"],text,ents,legacy,markup)
-        return msg.message_id
     except TelegramBadRequest:
         if not src:raise
         r=await bot.copy_message(chat_id=cid,from_chat_id=src[0],message_id=src[1],reply_markup=markup)
-        return r.message_id
+        return r.message_id,None
+    kept=None
+    if want:
+        # Telegram echoes back the message it stored — so we can tell at once whether it kept
+        # the Premium emoji or quietly dropped them.
+        got=sum(1 for e in ((msg.entities or msg.caption_entities) or []) if e.type=="custom_emoji")
+        kept=(got>0)
+    return msg.message_id,kept
 
 async def send_draft(bot,db,draft,cid,lang,premium):
     attr=await db.getset(f"attr_{lang}",tr(lang,"attr"))
     text,ents,legacy=draft_body(draft,premium,attr)
     markup=await build_markup(db,draft["id"])
-    mid=await publish_post(bot,draft,cid,text,ents,legacy,markup)
+    mid,kept=await publish_post(bot,draft,cid,text,ents,legacy,markup)
     await db.savepub(draft["user_id"],draft["id"],cid,mid)
-    return mid
+    return kept
 
 async def verify_tx(network,txid):
     if network=="bep20":
@@ -626,31 +635,54 @@ async def cmd_emojitest(m:Message,state:FSMContext):
 
 @dp.message(S.emojitest)
 async def run_emojitest(m:Message,state:FSMContext):
+    """Self-verdict diagnostic.
+
+    Telegram returns the message it actually stored, so the bot can compare the custom_emoji
+    entities it sent with the ones that came back. If they are gone, Telegram stripped them —
+    no human judgement (or trip to the channel) needed. Test posts are deleted afterwards."""
     await state.clear()
     ents=m.entities or m.caption_entities
-    names=[e.type+(":"+str(e.custom_emoji_id) if e.type=="custom_emoji" else "") for e in (ents or [])]
-    custom=sum(1 for e in (ents or []) if e.type=="custom_emoji")
-    await m.answer(f"🏷 BUILD: {BUILD}\n📋 Entities: "+(", ".join(names) or "йўқ")+f"\n⭐ custom_emoji: {custom} та")
+    want=sum(1 for e in (ents or []) if e.type=="custom_emoji")
+    head=f"🏷 BUILD: {BUILD}\n⭐ Сиз юборган Premium emoji: {want} та"
+    if not want:
+        return await m.answer(head+"\n\n⚠️ Бу хабарда Premium emoji йўқ (оддий emoji). Ҳақиқий Premium emoji билан қайта синанг.")
+    text=m.text or m.caption or " "
     res=[]
-    # A) here, in the private chat with the bot
+
+    def verdict(msg):
+        got=sum(1 for e in ((msg.entities or msg.caption_entities) or []) if e.type=="custom_emoji")
+        return ("✅ САҚЛАНДИ" if got else "❌ Telegram ОЛИБ ТАШЛАДИ")+f" ({got}/{want})"
+
+    # 1) private chat with the bot — the case that already worked
     try:
-        await m.bot.send_message(m.chat.id,m.text or m.caption or " ",entities=ents)
-        res.append("1️⃣ БОТ ЧАТИДА: юборилди")
-    except Exception as e:res.append("1️⃣ БОТ ЧАТИДА: ❌ "+str(e)[:150])
-    # B) the same thing in every channel/group the user publishes to — this is the real target
+        r=await m.bot.send_message(m.chat.id,text,entities=ents)
+        res.append("1️⃣ Бот чати · entities: "+verdict(r))
+    except Exception as e:res.append("1️⃣ Бот чати · entities: ❌ "+str(e)[:90])
+
     for d in await db.dests(m.from_user.id):
-        title=d["title"] or str(d["chat_id"])
+        cid=d["chat_id"];title=(d["title"] or str(cid))[:22]
+        # 2) entities straight into the channel
         try:
-            await m.bot.send_message(d["chat_id"],m.text or m.caption or " ",entities=ents)
-            res.append(f"2️⃣ {title}: entities юборилди")
-        except Exception as e:
-            res.append(f"2️⃣ {title}: ❌ "+str(e)[:120])
+            r=await m.bot.send_message(cid,text,entities=ents,disable_notification=True)
+            res.append(f"2️⃣ {title} · entities: "+verdict(r))
+            try:await m.bot.delete_message(cid,r.message_id)
+            except Exception:pass
+        except Exception as e:res.append(f"2️⃣ {title} · entities: ❌ "+str(e)[:90])
+        # 3) copyMessage into the channel. A copy only returns an id, so forward it back here
+        #    to read what the channel actually holds.
         try:
-            await m.bot.copy_message(chat_id=d["chat_id"],from_chat_id=m.chat.id,message_id=m.message_id)
-            res.append(f"3️⃣ {title}: copyMessage юборилди")
-        except Exception as e:
-            res.append(f"3️⃣ {title}: ❌ "+str(e)[:120])
-    await m.answer("\n".join(res)+"\n\n☝️ Энди КАНАЛГА кириб қаранг: 2️⃣ ва 3️⃣ хабарларда Premium emoji ЖОНЛИ кўриняптими? Натижани айтинг.")
+            cp=await m.bot.copy_message(chat_id=cid,from_chat_id=m.chat.id,message_id=m.message_id,disable_notification=True)
+            try:
+                fw=await m.bot.forward_message(chat_id=m.chat.id,from_chat_id=cid,message_id=cp.message_id)
+                res.append(f"3️⃣ {title} · copy: "+verdict(fw))
+            except Exception as e:
+                res.append(f"3️⃣ {title} · copy: юборилди, текшириб бўлмади ({str(e)[:50]})")
+            try:await m.bot.delete_message(cid,cp.message_id)
+            except Exception:pass
+        except Exception as e:res.append(f"3️⃣ {title} · copy: ❌ "+str(e)[:90])
+
+    await m.answer(head+"\n\n"+"\n".join(res)+
+                   "\n\n📌 Каналдаги тест хабарлар ўчириб ташланди. Шу жавобни менга юборинг.")
 
 @dp.message(CommandStart())
 async def start(m:Message,state:FSMContext):
@@ -1061,11 +1093,18 @@ async def publish_go(c:CallbackQuery):
     lang=await lang_of(c.from_user.id);s=dp.fsm.get_context(bot=c.bot,chat_id=c.from_user.id,user_id=c.from_user.id);data=await s.get_data();sel=data.get("selected",[]);did=data.get("did")
     if not sel:await c.answer("❌",show_alert=True);return
     dests=await db.dests(c.from_user.id);chosen=[d for d in dests if d["id"] in sel]
-    d=await db.getdraft(did);prem=await db.premium(c.from_user.id);ok=0
+    d=await db.getdraft(did);prem=await db.premium(c.from_user.id);ok=0;lost=False
     for dest in chosen:
-        try:await send_draft(c.bot,db,d,dest["chat_id"],lang,prem);ok+=1
+        try:
+            kept=await send_draft(c.bot,db,d,dest["chat_id"],lang,prem);ok+=1
+            if kept is False:lost=True
         except Exception as e:await c.message.answer(f"❌ {dest['title']}: {str(e)[:200]}")
-    await c.message.answer(f"{tr(lang,'published')} {ok}",reply_markup=kb_main(lang,c.from_user.id==ADMIN_ID));await s.clear()
+    note=""
+    if lost:
+        # Telegram accepted the post but dropped the Premium emoji — say so instead of letting
+        # the user discover it in the channel.
+        note="\n\n⚠️ Telegram бу каналда Premium emoji'ни олиб ташлади (пост юборилди, эможи оддий бўлди)."
+    await c.message.answer(f"{tr(lang,'published')} {ok}"+note,reply_markup=kb_main(lang,c.from_user.id==ADMIN_ID));await s.clear()
 
 @dp.callback_query(F.data=="prem:menu")
 async def prem_menu(c:CallbackQuery):
